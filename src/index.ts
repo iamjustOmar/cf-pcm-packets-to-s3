@@ -7,7 +7,8 @@ import { ChunkWriter } from "./chunkWriter";
 import type { PacketDto } from "./types";
 
 const ONE_MB = 1024 * 1024;
-const PCM_BYTES_PER_SAMPLE = 2;
+const PCM_BYTES_PER_SAMPLE = 4;
+const PCM_SAMPLE_FORMAT = "s32le";
 
 const cli = yargs(hideBin(process.argv))
   .scriptName("packet-chunker")
@@ -64,6 +65,18 @@ const cli = yargs(hideBin(process.argv))
     default: process.env.OUTPUT_DIR ?? "./output",
     describe: "Base local output directory",
   })
+  .option("pcm-sample-rate", {
+    type: "number",
+    demandOption: false,
+    default: Number(process.env.PCM_SAMPLE_RATE ?? 48_000),
+    describe: "PCM input sample rate in Hz (used for OPUS encoding)",
+  })
+  .option("pcm-channels", {
+    type: "number",
+    demandOption: false,
+    default: Number(process.env.PCM_CHANNELS ?? 1),
+    describe: "PCM input channel count (used for OPUS encoding)",
+  })
   .strict()
   .help();
 
@@ -81,6 +94,14 @@ async function main(): Promise<void> {
 
   if (!Number.isFinite(args["chunk-size-mb"]) || args["chunk-size-mb"] <= 0) {
     throw new Error("--chunk-size-mb must be a positive number");
+  }
+
+  if (!Number.isInteger(args["pcm-sample-rate"]) || args["pcm-sample-rate"] <= 0) {
+    throw new Error("--pcm-sample-rate must be a positive integer");
+  }
+
+  if (!Number.isInteger(args["pcm-channels"]) || args["pcm-channels"] <= 0) {
+    throw new Error("--pcm-channels must be a positive integer");
   }
 
   const brokers = args.brokers
@@ -101,9 +122,12 @@ async function main(): Promise<void> {
   const chunkWriter = new ChunkWriter(
     outputDir,
     Math.floor(args["chunk-size-mb"] * ONE_MB),
-    "pcm",
+    "opus",
+    PCM_SAMPLE_FORMAT,
+    args["pcm-sample-rate"],
+    args["pcm-channels"],
   );
-  let pendingPcmByte: number | null = null;
+  let pendingPcmRemainder = Buffer.alloc(0);
 
   const kafka = new Kafka({
     brokers,
@@ -129,7 +153,7 @@ async function main(): Promise<void> {
     );
   }
 
-  const consumer = kafka.consumer({ groupId: args["group-id"] });
+  const consumer = kafka.consumer({ groupId: args["group-id"], maxBytes: 5242880, maxWaitTimeInMs: 5000, minBytes: 1, maxBytesPerPartition: 5242880 });
 
   consumer.on(consumer.events.GROUP_JOIN, (event) => {
     const assigned = event.payload.memberAssignment[topicName] ?? [];
@@ -152,12 +176,12 @@ async function main(): Promise<void> {
     try {
       await consumer.disconnect();
     } finally {
-      if (pendingPcmByte !== null) {
+      if (pendingPcmRemainder.length > 0) {
         console.warn(
-          "Dropping trailing 1 byte to preserve 16-bit PCM sample alignment.",
+          `Dropping trailing ${pendingPcmRemainder.length} byte(s) to preserve ${PCM_SAMPLE_FORMAT} sample alignment.`,
         );
       }
-      chunkWriter.close();
+      await chunkWriter.close();
     }
     process.exit(0);
   };
@@ -184,6 +208,9 @@ async function main(): Promise<void> {
       `groupId=${args["group-id"]}`,
       `commit=${args.commit ? "on" : "off"}`,
       `chunkSizeMb=${args["chunk-size-mb"]}`,
+      `pcmFormat=${PCM_SAMPLE_FORMAT}`,
+      `pcmSampleRate=${args["pcm-sample-rate"]}`,
+      `pcmChannels=${args["pcm-channels"]}`,
       `outputDir=${outputDir}`,
     ].join(" | "),
   );
@@ -271,25 +298,30 @@ async function main(): Promise<void> {
         return;
       }
 
+      if (!Number.isFinite(parsed.packet.timestamp)) {
+        console.warn(
+          `Skipping message at offset ${message.offset}: packet.timestamp missing or not finite`,
+        );
+        await commitProcessedOffset(topic, partition, message.offset);
+        return;
+      }
+
       let bytes = Buffer.from(payload);
 
-      if (pendingPcmByte !== null) {
-        if (bytes.length === 0) {
-          await commitProcessedOffset(topic, partition, message.offset);
-          await heartbeat();
-          return;
-        }
-        bytes = Buffer.concat([Buffer.from([pendingPcmByte]), bytes]);
-        pendingPcmByte = null;
+      if (pendingPcmRemainder.length > 0) {
+        bytes = Buffer.concat([pendingPcmRemainder, bytes]);
+        pendingPcmRemainder = Buffer.alloc(0);
       }
 
       if (bytes.length % PCM_BYTES_PER_SAMPLE !== 0) {
-        pendingPcmByte = bytes[bytes.length - 1];
-        bytes = bytes.subarray(0, bytes.length - 1);
+        const alignedLength =
+          bytes.length - (bytes.length % PCM_BYTES_PER_SAMPLE);
+        pendingPcmRemainder = bytes.subarray(alignedLength);
+        bytes = bytes.subarray(0, alignedLength);
       }
 
       if (bytes.length > 0) {
-        chunkWriter.write(bytes);
+        await chunkWriter.write(bytes, parsed.packet.timestamp);
       }
 
       await commitProcessedOffset(topic, partition, message.offset);

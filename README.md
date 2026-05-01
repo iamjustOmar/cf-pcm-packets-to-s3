@@ -3,8 +3,9 @@
 CLI app that:
 - consumes JSON `PacketDto` messages from Kafka,
 - listens for a specific partition,
-- reconstructs `packet.payload` as PCM stream (`s16le`),
-- writes local `.pcm` files in 5 MB chunks.
+- reconstructs `packet.payload` as PCM stream (`s32le`, mono, 48kHz by default),
+- converts each chunk to OPUS,
+- writes local `.opus` files in 5 MB PCM-equivalent chunks.
 
 ## Data shape
 
@@ -31,6 +32,7 @@ Expected Kafka message value (JSON):
    - `npm install`
 3. Optional env file:
    - `cp .env.example .env`
+4. No system ffmpeg needed; app uses bundled `ffmpeg-static` dependency.
 
 ## Run (dev)
 
@@ -56,17 +58,19 @@ npm start -- --topic packets-topic --partition 2 --key my-partition-key --broker
 - `--commit` / `--no-commit`: enable/disable committing offsets (default enabled)
 - `--chunk-size-mb`: chunk size in MB (default `5`)
 - `--output-dir`: base output directory (default `./output`)
+- `--pcm-sample-rate`: input PCM sample rate in Hz (default `48000`)
+- `--pcm-channels`: input PCM channels (default `1`)
 
 Output path format:
 
-`<output-dir>/<topic>/partition-<n>/chunk-000001.pcm`
+`<output-dir>/<topic>/partition-<n>/chunk-000001.opus`
 
 ## Notes
 
 - Offsets are committed only after a message is processed and written.
 - Use `--no-commit` to replay the same data again without advancing offsets.
 - When `--key` is set, non-matching messages are skipped (and committed only if `--commit` is enabled).
-- Payload bytes are validated (`0..255`), and sample alignment is preserved for 16-bit PCM (`s16le`) across packet boundaries.
+- Payload bytes are validated (`0..255`), and sample alignment is preserved for 32-bit PCM (`s32le`) across packet boundaries.
 - A dedicated consumer group is recommended for partition-focused runs.
 - This is local chunking only; multipart upload can be added next.
 
