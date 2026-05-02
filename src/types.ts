@@ -8,4 +8,5 @@ export type PacketDto = {
   trackId: string;
   userId: string;
   packet: Packet;
+  unixTimestamp: number;
 };

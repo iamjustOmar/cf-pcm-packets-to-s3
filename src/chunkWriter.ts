@@ -8,35 +8,50 @@ function timestampToFileSegment(ts: number): string {
   return String(ts).replace(/-/g, "x").replace(/\./g, "p");
 }
 
+export type ChunkResult = {
+  localPath: string;
+  s3Key: string;
+};
+
+export type ChunkWriterOptions = {
+  baseOutputDir: string;
+  sessionId: string;
+  userId: string;
+  chunkSizeBytes: number;
+  fileExtension?: string;
+  sampleFormat?: string;
+  sampleRate?: number;
+  channels?: number;
+  onChunkReady?: (result: ChunkResult) => void;
+};
+
 export class ChunkWriter {
   private readonly chunkSizeBytes: number;
-  private readonly outputDir: string;
+  private readonly localDir: string;
+  private readonly s3Prefix: string;
   private readonly fileExtension: string;
   private readonly sampleFormat: string;
   private readonly sampleRate: number;
   private readonly channels: number;
+  private readonly onChunkReady?: (result: ChunkResult) => void;
   private chunkIndex = 1;
   private currentChunk = Buffer.alloc(0);
   private currentChunkLabelTimestamp: number | null = null;
   private pendingWrite = Promise.resolve();
 
-  constructor(
-    outputDir: string,
-    chunkSizeBytes: number,
-    fileExtension = "bin",
-    sampleFormat = "s32le",
-    sampleRate = 48_000,
-    channels = 1,
-  ) {
-    this.outputDir = outputDir;
-    this.chunkSizeBytes = chunkSizeBytes;
-    this.fileExtension = fileExtension;
-    this.sampleFormat = sampleFormat;
-    this.sampleRate = sampleRate;
-    this.channels = channels;
+  constructor(opts: ChunkWriterOptions) {
+    this.chunkSizeBytes = opts.chunkSizeBytes;
+    this.fileExtension = opts.fileExtension ?? "opus";
+    this.sampleFormat = opts.sampleFormat ?? "s32le";
+    this.sampleRate = opts.sampleRate ?? 48_000;
+    this.channels = opts.channels ?? 1;
+    this.onChunkReady = opts.onChunkReady;
 
-    if (!existsSync(this.outputDir)) {
-      mkdirSync(this.outputDir, { recursive: true });
+    this.localDir = path.join(opts.baseOutputDir, opts.sessionId, opts.userId);
+    this.s3Prefix = `${opts.sessionId}/${opts.userId}`;
+
+    if (!existsSync(this.localDir)) {
+      mkdirSync(this.localDir, { recursive: true });
     }
   }
 
@@ -68,6 +83,15 @@ export class ChunkWriter {
     return this.pendingWrite;
   }
 
+  forceFlush(): Promise<void> {
+    this.pendingWrite = this.pendingWrite.then(async () => {
+      if (this.currentChunk.length > 0) {
+        await this.flushChunk();
+      }
+    });
+    return this.pendingWrite;
+  }
+
   async close(): Promise<void> {
     await this.pendingWrite;
     if (this.currentChunk.length > 0) {
@@ -87,11 +111,15 @@ export class ChunkWriter {
     this.currentChunkLabelTimestamp = null;
 
     const tsSeg = timestampToFileSegment(ts);
-    const fileName = `chunk-${tsSeg}-${this.chunkIndex.toString().padStart(6, "0")}.${this.fileExtension}`;
-    const filePath = path.join(this.outputDir, fileName);
+    const fileName = `${tsSeg}-${this.chunkIndex.toString().padStart(6, "0")}.${this.fileExtension}`;
+    const localPath = path.join(this.localDir, fileName);
+    const s3Key = `${this.s3Prefix}/${fileName}`;
+
     const opusData = await this.convertPcmToOpus(chunkData);
-    await writeFile(filePath, opusData);
+    await writeFile(localPath, opusData);
     this.chunkIndex += 1;
+
+    this.onChunkReady?.({ localPath, s3Key });
   }
 
   private convertPcmToOpus(pcmData: Buffer): Promise<Buffer> {

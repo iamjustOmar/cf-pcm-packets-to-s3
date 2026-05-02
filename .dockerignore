@@ -1,0 +1,8 @@
+node_modules
+dist
+output
+.env
+.git
+.DS_Store
+*.mp3
+*.opus

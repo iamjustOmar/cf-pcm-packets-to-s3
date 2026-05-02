@@ -12,42 +12,37 @@ import { hideBin } from "yargs/helpers";
 
 type OpusTrack = {
   absPath: string;
-  /** packet.timestamp from filename (sort only; timeline uses cumulative duration) */
-  sortTimestamp: number;
-  /** writer chunk file ordinal */
+  timestamp: number;
   fileOrdinal: number;
   durationSec: number;
 };
 
-/** chunk-<timestampEncoded>-<fileOrdinal>.opus — ts uses p for . x for - */
-const CHUNK_OPUS_NAME_RE = /^chunk-([^-]+)-(\d+)\.opus$/i;
+/**
+ * Filename format from chunkWriter: <timestampEncoded>-<ordinal>.opus
+ * timestampEncoded: digits, dots replaced with p, minus replaced with x
+ */
+const OPUS_NAME_RE = /^([^-]+)-(\d+)\.opus$/i;
 
 function fileSegmentToTimestamp(segment: string): number {
   return Number(segment.replace(/x/g, "-").replace(/p/g, "."));
 }
 
-function sortKeyFromChunkFile(absPath: string, stats: Stats): {
-  sortTimestamp: number;
+function parseOpusFilename(absPath: string, stats: Stats): {
+  timestamp: number;
   fileOrdinal: number;
 } {
   const base = path.basename(absPath);
-  const match = base.match(CHUNK_OPUS_NAME_RE);
+  const match = base.match(OPUS_NAME_RE);
   if (match) {
-    const sortTimestamp = fileSegmentToTimestamp(match[1]!);
+    const timestamp = fileSegmentToTimestamp(match[1]!);
     const fileOrdinal = Number(match[2]!);
-    if (Number.isFinite(sortTimestamp) && Number.isInteger(fileOrdinal)) {
-      return { sortTimestamp, fileOrdinal };
+    if (Number.isFinite(timestamp) && Number.isInteger(fileOrdinal)) {
+      return { timestamp, fileOrdinal };
     }
   }
-  return { sortTimestamp: fileCreationMs(stats), fileOrdinal: 0 };
-}
-
-function fileCreationMs(stats: Stats): number {
   const birth = stats.birthtimeMs;
-  if (Number.isFinite(birth) && birth > 0) {
-    return birth;
-  }
-  return stats.mtimeMs;
+  const fallback = Number.isFinite(birth) && birth > 0 ? birth : stats.mtimeMs;
+  return { timestamp: fallback, fileOrdinal: 0 };
 }
 
 async function collectOpusFiles(rootDir: string): Promise<string[]> {
@@ -146,31 +141,25 @@ function runFfmpeg(ffmpegPath: string, args: string[]): Promise<void> {
   });
 }
 
-function buildMixFilter(trackCount: number, delaysMs: number[]): string {
-  if (trackCount !== delaysMs.length) {
-    throw new Error("internal: delays length mismatch");
-  }
-
-  if (trackCount === 0) {
+function buildTimelineFilter(tracks: OpusTrack[], t0: number): string {
+  if (tracks.length === 0) {
     throw new Error("internal: no tracks");
   }
 
-  if (trackCount === 1) {
-    const d = delaysMs[0]!;
+  if (tracks.length === 1) {
+    const d = Math.max(0, Math.round((tracks[0]!.timestamp - t0) * 1000));
     return `[0:a]adelay=${d}|${d}[out]`;
   }
 
   const delayedLabels: string[] = [];
-  for (let i = 0; i < trackCount; i += 1) {
-    const d = delaysMs[i]!;
+  for (let i = 0; i < tracks.length; i += 1) {
+    const delayMs = Math.max(0, Math.round((tracks[i]!.timestamp - t0) * 1000));
     const label = `a${i}`;
-    delayedLabels.push(`[${i}:a]adelay=${d}|${d}[${label}]`);
+    delayedLabels.push(`[${i}:a]adelay=${delayMs}|${delayMs}[${label}]`);
   }
 
   const mixInputs = delayedLabels.map((_, i) => `[a${i}]`).join("");
-  const filter = `${delayedLabels.join(";")};${mixInputs}amix=inputs=${trackCount}:dropout_transition=0[out]`;
-
-  return filter;
+  return `${delayedLabels.join(";")};${mixInputs}amix=inputs=${tracks.length}:dropout_transition=0:normalize=0[out]`;
 }
 
 async function main(): Promise<void> {
@@ -185,8 +174,9 @@ async function main(): Promise<void> {
     .scriptName("merge-opus")
     .option("dir", {
       type: "string",
+      array: true,
       demandOption: true,
-      describe: "Directory to scan recursively for .opus files",
+      describe: "One or more directories to scan recursively for .opus files",
     })
     .option("output", {
       type: "string",
@@ -198,12 +188,17 @@ async function main(): Promise<void> {
     .help()
     .parseAsync();
 
-  const rootDir = path.resolve(argv.dir);
+  const dirs = argv.dir.map((d) => path.resolve(d));
   const outputPath = path.resolve(argv.output);
 
-  const opusPaths = await collectOpusFiles(rootDir);
+  const opusPaths: string[] = [];
+  for (const dir of dirs) {
+    const found = await collectOpusFiles(dir);
+    opusPaths.push(...found);
+  }
+
   if (opusPaths.length === 0) {
-    throw new Error(`No .opus files found under ${rootDir}`);
+    throw new Error(`No .opus files found under [${dirs.join(", ")}]`);
   }
 
   const tracks: OpusTrack[] = [];
@@ -214,29 +209,29 @@ async function main(): Promise<void> {
       probeDurationSec(ffprobePath, absPath),
     ]);
 
-    const { sortTimestamp, fileOrdinal } = sortKeyFromChunkFile(absPath, stats);
+    const { timestamp, fileOrdinal } = parseOpusFilename(absPath, stats);
 
     tracks.push({
       absPath,
-      sortTimestamp,
+      timestamp,
       fileOrdinal,
       durationSec,
     });
   }
 
   tracks.sort(
-    (a, b) => a.sortTimestamp - b.sortTimestamp || a.fileOrdinal - b.fileOrdinal,
+    (a, b) => a.timestamp - b.timestamp || a.fileOrdinal - b.fileOrdinal,
   );
 
-  /** end-to-end playback order: sorted by packet.timestamp only; spacing = clip durations */
-  let cumulativeMs = 0;
-  const delaysMs = tracks.map((t) => {
-    const delay = cumulativeMs;
-    cumulativeMs += Math.round(t.durationSec * 1000);
-    return delay;
-  });
+  const t0 = tracks[0]!.timestamp;
 
-  const filterComplex = buildMixFilter(tracks.length, delaysMs);
+  console.log(`Found ${tracks.length} tracks. t0=${t0} (unix seconds)`);
+  for (const t of tracks) {
+    const offsetMs = Math.round((t.timestamp - t0) * 1000);
+    console.log(`  ${path.basename(t.absPath)}  ts=${t.timestamp}  offset=${offsetMs}ms  dur=${(t.durationSec * 1000).toFixed(0)}ms`);
+  }
+
+  const filterComplex = buildTimelineFilter(tracks, t0);
 
   const args: string[] = ["-y"];
 
@@ -260,7 +255,7 @@ async function main(): Promise<void> {
 
   await runFfmpeg(ffmpegPath, args);
 
-  console.log(`Wrote ${outputPath} (mixed ${tracks.length} tracks)`);
+  console.log(`Wrote ${outputPath} (${tracks.length} tracks on timeline)`);
 }
 
 void main().catch((error) => {
