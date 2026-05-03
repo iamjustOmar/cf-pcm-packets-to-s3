@@ -5,7 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx src/index.ts",
-    "merge-opus": "tsx src/mergeOpusToMp3.ts",
+    "merge-opus": "tsx src/mergeOpus.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js"
   },

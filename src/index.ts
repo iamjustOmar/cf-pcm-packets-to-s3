@@ -472,6 +472,10 @@ async function main(): Promise<void> {
         return;
       }
 
+      // console.log(
+      //   `received data | offset=${message.offset} key=${rawKey} seq=${parsed.packet.sequenceNumber} payloadBytes=${payload.length} unixTs=${parsed.unixTimestamp}`,
+      // );
+
       const entry = getOrCreateWriter(parsedKey.sessionId, parsedKey.userId);
       const writerKey = `${parsedKey.sessionId}:${parsedKey.userId}`;
       const seq = parsed.packet.sequenceNumber;
