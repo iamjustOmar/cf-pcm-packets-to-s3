@@ -31,6 +31,7 @@ const cli = yargs(hideBin(process.argv))
   .option("partition", {
     type: "number",
     demandOption: true,
+    default: process.env.KAFKA_PARTITION,
     describe: "Kafka partition to consume",
   })
   .option("key", {
